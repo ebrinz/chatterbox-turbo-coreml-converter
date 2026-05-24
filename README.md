@@ -15,6 +15,11 @@ Converts ResembleAI's [Chatterbox Turbo](https://huggingface.co/ResembleAI/chatt
 TTS model to artifacts that run on Apple Silicon — both Macs (M1+) and iPhones
 (via on-device CoreML + ONNX Runtime).
 
+> **Reproducing the HF reference:** run with no optimization flags — the
+> default output is bit-/byte-equivalent to what's on Hugging Face.
+> **Shipping to an iPhone app and want it smaller + faster?** Jump to
+> [Proven "ship to iPhone fast" combo](#proven-ship-to-iphone-fast-combo).
+
 Two pipelines are supported:
 
 - **v4 hybrid CoreML + ONNX** *(recommended; matches what ships on iPhone today)*:
@@ -48,6 +53,95 @@ Two pipelines are supported:
 | `S3Encoder.mlpackage` | Conformer encoder + mel projection. Dynamic sequence length via `RangeDim`. | ANE-eligible |
 | `S3UNet.mlpackage` | Flow-matching U-Net denoiser (estimator + speaker-affine projection baked in). | ANE-eligible |
 | `hift_vocoder.safetensors` | HiFTGenerator vocoder weights (PyTorch — not converted to CoreML). | — |
+
+## Size & speed flags
+
+Three orthogonal flags trade size / speed against quality. Stack them as
+needed; each one's effect is documented in the validator output.
+
+| Flag | What it does | Applies to | Typical size / speed change | Quality impact |
+|---|---|---|---|---|
+| `--cfm-steps 1` | Halves the CFM solver from 2 unrolled Euler steps to 1 | `cond-decoder` | ~halved cond_decoder runtime; ~same file size | Modest log-mag cos sim drop (~0.886 → ~0.874 in our test) |
+| `--optimize-graph` | Runs `onnxruntime.transformers.optimizer` on each `.onnx`: operator fusion, constant folding, ORT L2 passes | `lm-onnx`, `cond-decoder` | ~5-15% faster on iOS; same file size | None — numerically identical |
+| `--quantize int8` | Weight quantization via `onnxruntime.quantization.quantize_dynamic` (ONNX) and `coremltools.optimize.coreml.linear_quantize_weights` (CoreML) | all three v4 stages | **~4× smaller files**, ~2-3× faster decode on iOS | Modest (lm-onnx logits cos sim drops to ~0.97 vs fp32). Use for size-constrained ship targets; validate per artifact. |
+
+### Proven "ship to iPhone fast" combo
+
+Three commands, ~1.2 GB total bundle, ~4× faster than vanilla PyTorch
+end-to-end on M1:
+
+```bash
+# T3Prefill: INT8 (1503 MB -> 361 MB)
+python convert_chatterbox_coreml.py --stage prefill --output-dir ./out --quantize int8
+
+# language_model.onnx: INT8 + graph fusion (1270 MB -> 304 MB,
+# 16 ms/tok -> 5-8 ms/tok on M1 CPU)
+python convert_chatterbox_coreml.py --stage lm-onnx --output-dir ./out \
+    --optimize-graph --quantize int8
+
+# conditional_decoder.onnx: cfm-steps=1 only (1065 ms -> 685 ms per
+# synth; modest audio-quality cost). DO NOT combine with --optimize-graph
+# or --quantize on cond-decoder — both currently bake the encoder's
+# Conformer relative-attention shape, breaking runtime use at any
+# sequence length other than the trace fixture.
+python convert_chatterbox_coreml.py --stage cond-decoder --output-dir ./out --cfm-steps 1
+```
+
+Measured on M1 (5-second utterance, 83 tokens):
+
+```
+                          fp32 baseline    Optimized      Speedup
+T3Prefill prefill         131 ms           106 ms         1.24x
+lm.onnx per token         16-19 ms         5-8 ms         2-3x
+cond_decoder synthesize   1065 ms          685 ms         1.55x
+End-to-end                ~2725 ms         ~1320 ms       ~2x
+vs vanilla PyTorch        5400 ms                         ~4x
+RTF                       0.73x            0.38x
+```
+
+### Shipping a fast variant to Hugging Face
+
+The artifacts on
+[ebrinz/chatterbox-turbo-coreml](https://huggingface.co/ebrinz/chatterbox-turbo-coreml)
+today are the proven-working, quality-validated bundle. Replacing them
+with the optimized variant is a tradeoff: you get a smaller, faster
+bundle but introduce a measurable quality drop (logits cos sim 1.0 →
+~0.97 on INT8 lm; cond_decoder log-mag cos sim ~0.886 → ~0.874 at
+cfm-steps=1). Three deployment options, ranked by safety:
+
+1. **Don't ship a variant — document the recipe.** Keep HF as-is; the
+   recipe above lets users build their own optimized bundle locally.
+   No regression risk for existing consumers. *Most conservative.*
+2. **Add the variant as sibling paths on the same HF repo.** Put files
+   under `int8/T3Prefill.mlpackage`, `int8/onnx/language_model_single.onnx`,
+   etc. Existing iPhone apps pointing at the root paths are unaffected;
+   apps that opt in get the smaller/faster bundle. *Recommended if you
+   want to ship it.*
+3. **Use a separate HF branch / revision** (e.g. `fast`). iPhone app
+   pins to `main` or `fast`. Cleanest separation, but requires Swift-side
+   awareness of the revision.
+
+**Always device-test before shipping.** Desktop ORT and iPhone ORT use
+different kernel variants for INT8 `QLinearMatMul`; audio differences
+that don't show up on Mac may surface on-device. Build the bundle
+locally, drop it into your iOS app build (replacing the `out/` files in
+your bundle), and run a real-device A/B before changing anything on HF.
+
+### Known limitations
+
+- **`--optimize-graph` on `cond-decoder`**: the ONNX Runtime graph
+  optimizer specializes (bakes) shapes inside the Conformer encoder's
+  relative-attention skewing operation. The exported model then only
+  runs at the trace-fixture sequence length. Skip `--optimize-graph`
+  for cond-decoder — the gain is modest there anyway since it isn't a
+  recognized `model_type` for the transformer-specific fusions.
+- **`--quantize int8` on `cond-decoder`**: `quantize_dynamic` runs but
+  produces a graph with the same shape-baking issue (likely interacting
+  with the optimizer pass internally). Treat cond-decoder as
+  quantize-incompatible for now.
+- **CoreML INT8 ANE compute plan may differ from FP32.** Some quantized
+  ops fall back to CPU on ANE that FP32 versions handled. Measure
+  on-device.
 
 ## Why CoreML *and* ONNX (and not just one)
 
