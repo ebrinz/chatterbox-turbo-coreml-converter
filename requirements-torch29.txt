@@ -1,0 +1,44 @@
+# Isolated venv for the torch 2.9 export path used by `--stage cond-decoder
+# --torch29`. Use:
+#
+#   python -m venv .venv-torch29 && source .venv-torch29/bin/activate
+#   pip install -r requirements-torch29.txt
+#   pip install --no-deps chatterbox-tts==0.1.7  # see note below
+#
+#   python convert_chatterbox_coreml.py \
+#     --stage cond-decoder --output-dir ./out --torch29
+#
+# Keep the main requirements.txt on torch 2.8 for Stages A/B — that combo
+# is proven bit-equivalent to the HF release and there's no reason to
+# touch it. This file is for the cond-decoder leg only.
+#
+# chatterbox-tts==0.1.7 hard-pins torch==2.6.0 and transformers==5.2.0;
+# both pins are unnecessarily strict (works fine with the versions here).
+# Install it with `--no-deps`, separately from `pip install -r`. The
+# chatterbox runtime imports we exercise (T3, S3Gen, HiFTGenerator) all
+# work under torch 2.9 + transformers 4.57.
+
+torch==2.9.0
+torchaudio==2.9.0
+coremltools>=9.0
+numpy>=1.24,<2.0  # chatterbox-tts internals don't tolerate numpy 2.x
+"safetensors==0.5.3"  # match chatterbox-tts's expected version
+huggingface_hub>=0.24
+"transformers>=4.55,<5.0"
+pyyaml>=6.0
+onnx>=1.17
+onnxruntime>=1.18
+# Required by torch.onnx.export(..., dynamo=True).
+onnxscript>=0.7
+# perth (chatterbox runtime dep) uses pkg_resources, removed in setuptools 81+.
+"setuptools<81"
+pyloudnorm
+resemble-perth
+# Chatterbox's other runtime deps (sans the over-tight torch pin)
+"librosa>=0.10"
+diffusers
+conformer
+s3tokenizer
+omegaconf
+# For scripts/play_sample.py
+soundfile>=0.12

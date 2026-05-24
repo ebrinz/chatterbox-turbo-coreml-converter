@@ -1530,6 +1530,13 @@ class _ConditionalDecoderWrapper(nn.Module):
 
         # --- token embedding + Conformer encoder ----------------------------
         T_total = speech_tokens.shape[1]
+        T_feat = speaker_features.shape[1]
+        # Dynamo (torch 2.9 path) finds size-specialization branches in the
+        # encoder; assert minimal bounds so it knows our Dim range avoids
+        # those specializations. No-ops at runtime.
+        torch._check(T_total >= 2)
+        torch._check(T_feat >= 2)
+        torch._check(2 * T_total - T_feat >= 1)
         # Length tensor for the encoder. No padding (batch=1 full sequence).
         token_len = torch.tensor([T_total], dtype=torch.long, device=speech_tokens.device)
         x = self.input_embedding(speech_tokens.long())  # (1, T_total, in_dim)
@@ -1791,14 +1798,184 @@ def _patch_chatterbox_for_export():
     _cm_mask._export_safe = True
 
 
-def convert_conditional_decoder(model, output_dir, validate=False, reference_dir=None):
-    """Export the full post-T3 audio chain as conditional_decoder_single.onnx."""
-    print("\n=== Converting conditional_decoder_single.onnx ===")
+def _patch_chatterbox_for_export_minimal():
+    """Apply only the patches needed to dodge actual chatterbox bugs +
+    chatterbox-code-style problems (vs the bypass patches that drop
+    functionality). Used by torch29 mode.
+
+    Still applied:
+    - add_optional_chunk_mask .item() check (data-dependent guard)
+    - EspnetRelPositionalEncoding.extend_pe (in-place PE rebuild)
+    - SineGen.forward rewritten functionally — same outputs, no in-place
+      F_mat slice writes (which dynamo emits as ScatterND with int32
+      indices that ORT rejects), no Uniform.sample / randn (which torch
+      2.9's fake-tensor system mis-tracks dtypes on)
+    """
+    import numpy as _np
+    import chatterbox.models.s3gen.utils.mask as _cm_mask
+    from chatterbox.models.s3gen.utils.mask import subsequent_chunk_mask
+    import chatterbox.models.s3gen.decoder as _cm_dec
+    import chatterbox.models.s3gen.transformer.upsample_encoder as _cm_uenc
+    import chatterbox.models.s3gen.transformer.embedding as _cm_emb
+    import chatterbox.models.s3gen.hifigan as _cm_hifi
+
+    if getattr(_cm_mask, "_export_safe_minimal", False):
+        return
+
+    def _safe_add_optional_chunk_mask(
+        xs, masks, use_dynamic_chunk, use_dynamic_left_chunk,
+        decoding_chunk_size, static_chunk_size, num_decoding_left_chunks,
+        enable_full_context=True,
+    ):
+        if use_dynamic_chunk:
+            max_len = xs.size(1)
+            if decoding_chunk_size < 0:
+                chunk_size = max_len; num_left_chunks = -1
+            elif decoding_chunk_size > 0:
+                chunk_size = decoding_chunk_size
+                num_left_chunks = num_decoding_left_chunks
+            else:
+                chunk_size = max_len
+                num_left_chunks = -1
+            chunk_masks = subsequent_chunk_mask(
+                xs.size(1), chunk_size, num_left_chunks, xs.device
+            ).unsqueeze(0)
+            chunk_masks = masks & chunk_masks
+        elif static_chunk_size > 0:
+            chunk_masks = subsequent_chunk_mask(
+                xs.size(1), static_chunk_size, num_decoding_left_chunks, xs.device
+            ).unsqueeze(0)
+            chunk_masks = masks & chunk_masks
+        else:
+            chunk_masks = masks
+        return chunk_masks
+
+    def _noop_extend_pe(self, x):
+        return
+
+    def _functional_sine_gen_forward(self, f0):
+        """SineGen.forward without in-place writes or random ops.
+
+        Replaces the original:
+          F_mat = torch.zeros(...)
+          for i in range(harmonic_num + 1):
+              F_mat[:, i:i+1, :] = f0 * (i+1) / sr   # in-place -> ScatterND
+          phase_vec = Uniform(-pi, pi).sample(...)   # randn dtype issues
+          phase_vec[:, 0, :] = 0                      # in-place
+          sine = amp * sin(theta + phase_vec)
+          noise = noise_amp * randn_like(sine)        # randn dtype issues
+          sine = sine * uv + noise
+
+        With a vectorized + deterministic equivalent. Zero phase is fine
+        because sin is rotation-invariant around the start sample; zero noise
+        omits the additive HnNSF noise term (small quality cost, much
+        cleaner export).
+        """
+        H = self.harmonic_num + 1
+        multipliers = torch.arange(
+            1, H + 1, dtype=f0.dtype, device=f0.device
+        ).view(1, H, 1)
+        # f0: (B, 1, T) -> F_mat: (B, H, T)
+        F_mat = (f0 * multipliers) / self.sampling_rate
+        theta_mat = 2.0 * _np.pi * torch.cumsum(F_mat, dim=-1)
+        sine_waves = self.sine_amp * torch.sin(theta_mat)
+        uv = (f0 > self.voiced_threshold).to(f0.dtype)
+        sine_waves = sine_waves * uv
+        noise = torch.zeros_like(sine_waves)
+        return sine_waves, uv, noise
+
+    # ISTFT replacement: torch 2.9 dynamo's torch.istft decomposition emits a
+    # _fft_c2r output whose last-dim shape (9 = n_fft//2+1) doesn't broadcast
+    # with the stft_window (16 = n_fft) in a downstream Mul, raising a
+    # BroadcastIterator error at ORT runtime. Use the same primitive
+    # implementation as legacy mode — it stays inside dynamo-friendly ops
+    # (Cast/MatMul/Sin/Cos/ConvTranspose1d) and produces equivalent output.
+    def _safe_istft_for_torch29(self, magnitude, phase):
+        n_fft = self.istft_params["n_fft"]
+        hop = self.istft_params["hop_len"]
+        K = n_fft // 2 + 1
+        window = self.stft_window.to(magnitude.device).to(magnitude.dtype)
+
+        magnitude = torch.clip(magnitude, max=1.0e2)
+        real = magnitude * torch.cos(phase)
+        imag = magnitude * torch.sin(phase)
+
+        weights = torch.ones(K, dtype=magnitude.dtype, device=magnitude.device)
+        weights[1 : K - 1] = 2.0
+
+        n_idx = torch.arange(n_fft, dtype=magnitude.dtype, device=magnitude.device)
+        k_idx = torch.arange(K, dtype=magnitude.dtype, device=magnitude.device)
+        angle = (2.0 * torch.pi / n_fft) * k_idx[:, None] * n_idx[None, :]
+        cos_basis = torch.cos(angle)
+        sin_basis = torch.sin(angle)
+
+        real_w = (real * weights[None, :, None]).transpose(1, 2)
+        imag_w = (imag * weights[None, :, None]).transpose(1, 2)
+
+        frames = (real_w @ cos_basis - imag_w @ sin_basis) / n_fft
+        frames = frames * window[None, None, :]
+
+        x_for_ct = frames.transpose(1, 2).contiguous()
+        eye_kernel = torch.eye(n_fft, dtype=magnitude.dtype, device=magnitude.device).unsqueeze(1)
+        ola = torch.nn.functional.conv_transpose1d(x_for_ct, eye_kernel, stride=hop).squeeze(1)
+
+        win_sq = (window ** 2)[None, :, None].expand(1, n_fft, frames.shape[1])
+        env = torch.nn.functional.conv_transpose1d(win_sq, eye_kernel, stride=hop).squeeze(1)
+        env = torch.clamp(env, min=1.0e-10)
+        out = ola / env
+
+        trim = n_fft // 2
+        out_len = ola.shape[1]
+        return out[:, trim : out_len - trim]
+
+    _cm_mask.add_optional_chunk_mask = _safe_add_optional_chunk_mask
+    _cm_dec.add_optional_chunk_mask = _safe_add_optional_chunk_mask
+    _cm_uenc.add_optional_chunk_mask = _safe_add_optional_chunk_mask
+    _cm_emb.EspnetRelPositionalEncoding.extend_pe = _noop_extend_pe
+    _cm_hifi.SineGen.forward = _functional_sine_gen_forward
+    _cm_hifi.HiFTGenerator._istft = _safe_istft_for_torch29
+    _cm_mask._export_safe_minimal = True
+
+
+def _torch_at_least(version_str: str) -> bool:
+    """True if installed torch is >= the dotted version string (major.minor)."""
+    want = tuple(int(x) for x in version_str.split("."))
+    have = tuple(int(x) for x in torch.__version__.split(".")[: len(want)] if x.isdigit())
+    return have >= want
+
+
+def convert_conditional_decoder(model, output_dir, validate=False, reference_dir=None,
+                                  mode="legacy"):
+    """Export the full post-T3 audio chain as conditional_decoder_single.onnx.
+
+    Modes:
+      legacy   — torch 2.8 path. Applies chatterbox monkey-patches (zero
+                 HnNSF source, manual ISTFT via conv_transpose1d, no-op PE
+                 rebuild). Audio quality degraded vs HF (~0.89 cos sim).
+                 Opset 18 (need col2im for the manual overlap-add).
+      torch29  — torch ≥ 2.9 path matching HF's published artifact.
+                 Skips the SineGen / STFT / ISTFT bypass patches so the
+                 native f0+source harmonics and torch.stft/istft survive
+                 the trace. Uses dynamo + opset 17 (same as HF). The two
+                 chatterbox-side patches that fix actual chatterbox bugs
+                 (data-dependent mask check, in-place PE rebuild) are
+                 still applied — they aren't torch-version-specific.
+    """
+    if mode == "torch29" and not _torch_at_least("2.9"):
+        raise RuntimeError(
+            f"--torch29 mode needs torch>=2.9 (have {torch.__version__}). "
+            f"Use .venv-torch29 with `pip install -r requirements-torch29.txt`."
+        )
+
+    print(f"\n=== Converting conditional_decoder_single.onnx (mode={mode}) ===")
     onnx_dir = os.path.join(output_dir, "onnx")
     os.makedirs(onnx_dir, exist_ok=True)
     out_path = os.path.join(onnx_dir, "conditional_decoder_single.onnx")
 
-    _patch_chatterbox_for_export()
+    if mode == "legacy":
+        _patch_chatterbox_for_export()
+    else:
+        _patch_chatterbox_for_export_minimal()
 
     wrapper = _ConditionalDecoderWrapper(model.s3gen)
     wrapper.train(False)
@@ -1808,38 +1985,135 @@ def convert_conditional_decoder(model, output_dir, validate=False, reference_dir
     spk_pt = torch.from_numpy(spk_t)
     feat_pt = torch.from_numpy(feat_t)
 
-    print(
-        f"  Exporting with T_total={speech_pt.shape[1]} speech tokens, "
-        f"T_feat={feat_pt.shape[1]} mel frames, opset 18 (legacy)..."
-    )
-
-    # Legacy TorchScript exporter. Opset 18 (vs HF's 17): we need col2im
-    # for the manual ISTFT overlap-add via F.fold — HF used native STFT op
-    # which is opset 17, but we replaced that with primitives to dodge the
-    # complex-types limitation.
-    dynamic_axes = {
-        "speech_tokens": {1: "num_speech_tokens"},
-        "speaker_features": {1: "feature_dim"},
-        "waveform": {1: "num_samples"},
-    }
-
-    with torch.no_grad():
-        torch.onnx.export(
-            wrapper,
-            (speech_pt, spk_pt, feat_pt),
-            out_path,
-            input_names=["speech_tokens", "speaker_embeddings", "speaker_features"],
-            output_names=["waveform"],
-            dynamic_axes=dynamic_axes,
-            opset_version=18,
-            do_constant_folding=True,
+    if mode == "legacy":
+        print(
+            f"  Exporting with T_total={speech_pt.shape[1]} speech tokens, "
+            f"T_feat={feat_pt.shape[1]} mel frames, opset 18 (legacy)..."
         )
+        # Legacy TorchScript exporter. Opset 18 (vs HF's 17): need col2im
+        # for the manual ISTFT overlap-add via F.fold.
+        dynamic_axes = {
+            "speech_tokens": {1: "num_speech_tokens"},
+            "speaker_features": {1: "feature_dim"},
+            "waveform": {1: "num_samples"},
+        }
+        with torch.no_grad():
+            torch.onnx.export(
+                wrapper,
+                (speech_pt, spk_pt, feat_pt),
+                out_path,
+                input_names=["speech_tokens", "speaker_embeddings", "speaker_features"],
+                output_names=["waveform"],
+                dynamic_axes=dynamic_axes,
+                opset_version=18,
+                do_constant_folding=True,
+            )
+    else:
+        print(
+            f"  Exporting with T_total={speech_pt.shape[1]} speech tokens, "
+            f"T_feat={feat_pt.shape[1]} mel frames, opset 20 (dynamo, torch29)..."
+        )
+        # Dynamo exporter, opset 20. Opset 17 (HF's choice) requires
+        # downconverting Pad which onnxscript can't do; opset 18 emits a
+        # ScatterND node with an int32 input that ORT rejects (a torch 2.9
+        # exporter bug); opset 20 sidesteps both.
+        from torch.export import Dim
+
+        num_speech_tokens = Dim("num_speech_tokens", min=2, max=4096)
+        feat_dim = Dim("feature_dim", min=2, max=4096)
+        dynamic_shapes = (
+            {1: num_speech_tokens},
+            None,
+            {1: feat_dim},
+        )
+        with torch.no_grad():
+            torch.onnx.export(
+                wrapper,
+                (speech_pt, spk_pt, feat_pt),
+                out_path,
+                input_names=["speech_tokens", "speaker_embeddings", "speaker_features"],
+                output_names=["waveform"],
+                dynamic_shapes=dynamic_shapes,
+                opset_version=20,
+                dynamo=True,
+            )
+
+    if mode == "torch29":
+        _fix_scatternd_int32_indices(out_path)
 
     size_mb = os.path.getsize(out_path) / 1e6
+    # Don't double-count external data files
+    data_path = out_path + ".data"
+    if os.path.exists(data_path):
+        size_mb += os.path.getsize(data_path) / 1e6
     print(f"  Wrote {size_mb:.1f} MB")
 
     if validate:
         validate_conditional_decoder(model, out_path, reference_dir=reference_dir)
+
+
+def _fix_scatternd_int32_indices(onnx_path: str) -> None:
+    """torch 2.9 dynamo sometimes emits ScatterND with int32 indices, which
+    ORT rejects (the spec requires int64). Walk the graph, insert a Cast
+    int32 -> int64 in front of every offending ScatterND."""
+    import onnx
+    from onnx import helper, TensorProto
+
+    model = onnx.load(onnx_path, load_external_data=False)
+    g = model.graph
+
+    # Build a name -> elem_type lookup from initializers + value_infos + inputs
+    name_to_type: dict[str, int] = {}
+    for init in g.initializer:
+        name_to_type[init.name] = init.data_type
+    for vi in list(g.value_info) + list(g.input) + list(g.output):
+        if vi.type.HasField("tensor_type"):
+            name_to_type[vi.name] = vi.type.tensor_type.elem_type
+    for node in g.node:
+        for out_name in node.output:
+            # Casts are the most informative; we'll trust them when present
+            if node.op_type == "Cast":
+                attr = next((a for a in node.attribute if a.name == "to"), None)
+                if attr is not None:
+                    name_to_type[out_name] = attr.i
+
+    patched = 0
+    inserts: list[tuple[int, list]] = []  # (insertion index, [new nodes])
+    for idx, node in enumerate(g.node):
+        if node.op_type != "ScatterND":
+            continue
+        # ScatterND inputs: [data, indices, updates]
+        idx_in = node.input[1]
+        idx_type = name_to_type.get(idx_in)
+        if idx_type == TensorProto.INT64:
+            continue
+        # Insert Cast int? -> int64. Use the ScatterND node name in the cast
+        # output too — two ScatterND nodes might share the same indices input,
+        # and ORT rejects duplicate value names in a graph.
+        cast_out = f"{idx_in}__cast_int64__{node.name}"
+        cast_node = helper.make_node(
+            "Cast", [idx_in], [cast_out],
+            name=f"{node.name}__indices_cast_int64",
+            to=TensorProto.INT64,
+        )
+        node.input[1] = cast_out
+        inserts.append((idx, [cast_node]))
+        patched += 1
+
+    if not patched:
+        return
+
+    # Insert from the end so earlier indices stay valid
+    for ins_idx, new_nodes in reversed(inserts):
+        for j, n in enumerate(new_nodes):
+            g.node.insert(ins_idx + j, n)
+
+    print(f"  Patched {patched} ScatterND node(s) with Cast int32 -> int64")
+    onnx.save(model, onnx_path,
+              save_as_external_data=True,
+              all_tensors_to_one_file=True,
+              location=os.path.basename(onnx_path) + ".data",
+              size_threshold=1024)
 
 
 def validate_conditional_decoder(model, our_path, reference_dir=None):
@@ -1951,6 +2225,18 @@ def main():
             "sequentially (not in parallel with ours). Useful on 8 GB Macs."
         ),
     )
+    parser.add_argument(
+        "--torch29",
+        action="store_true",
+        help=(
+            "Use the torch >= 2.9 export path for --stage cond-decoder. "
+            "Skips the audio-quality-degrading chatterbox bypass patches "
+            "and emits the same op set as the HF reference (native STFT / "
+            "RandomNormalLike / com.microsoft.MultiHeadAttention). "
+            "Requires the .venv-torch29 venv built from "
+            "requirements-torch29.txt; will fail loudly otherwise."
+        ),
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1998,6 +2284,7 @@ def main():
         convert_conditional_decoder(
             v4_model, args.output_dir,
             validate=args.validate, reference_dir=args.reference_dir,
+            mode=("torch29" if args.torch29 else "legacy"),
         )
 
     print("\n=== Done ===")

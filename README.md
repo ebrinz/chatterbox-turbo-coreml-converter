@@ -231,7 +231,44 @@ in functorch; dynamo hits `ProxyTorchDispatchMode` assertions). Rewriting the
 two-block forward in primitives bypasses the cache machinery entirely while
 reusing the trained weight modules unchanged.
 
-### Stage C tradeoffs
+### Stage C: `--torch29` mode (real harmonics, dynamo exporter)
+
+The default Stage C path uses torch 2.8's legacy exporter (next section).
+A second path exists via the `--torch29` flag, run in an isolated
+`.venv-torch29` (`pip install -r requirements-torch29.txt`):
+
+```bash
+source .venv-torch29/bin/activate
+python convert_chatterbox_coreml.py --stage cond-decoder --output-dir ./out --torch29 \
+    --validate --reference-dir <hf-cache-dir>
+```
+
+This path uses torch 2.9 + the dynamo exporter and applies a much
+smaller patch set (`_patch_chatterbox_for_export_minimal`): the SineGen
+forward is rewritten *functionally* (same outputs, no in-place writes
+that emit ScatterND-with-int32 nodes that ORT rejects), real harmonic
+source synthesis is preserved (vs the legacy mode which zeroes it), and
+a post-export pass inserts Cast int32 → int64 in front of the two
+ScatterND nodes torch 2.9 currently emits with the wrong indices dtype.
+
+What you get vs the legacy mode:
+
+| | Legacy (torch 2.8) | `--torch29` (torch 2.9) |
+|---|---|---|
+| Opset | 18 | 20 |
+| File size | 552 MB | 597 MB |
+| SineGen harmonics | zeroed | real (functional rewrite) |
+| ISTFT | manual primitives (`conv_transpose1d`) | manual primitives (same — torch 2.9's native `torch.istft` decomposes to a Mul that ORT can't broadcast) |
+| Patches applied | 6 | 4 |
+| Log-mag cos sim vs HF (typical sample) | ~0.886 | ~0.894 |
+
+The metric barely moves because it's dominated by stochastic CFM noise
+(HF uses RandomNormal per call, so does our model — different instances).
+The structural fidelity is materially better in `--torch29` mode — the
+voiced texture is closer to HF — even when the bulk cos sim doesn't
+clearly reflect it. Listen via `scripts/play_sample.py`.
+
+### Stage C tradeoffs (legacy path)
 
 `conditional_decoder_single.onnx` exports through PyTorch 2.8's legacy
 TorchScript exporter at opset 18. Getting it through required four
