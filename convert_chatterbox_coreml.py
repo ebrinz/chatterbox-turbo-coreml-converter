@@ -1405,13 +1405,19 @@ def convert_prefill(model, output_dir, validate=False, reference_dir=None,
     # FLOAT32 matches the HF reference T3Prefill.mlmodelc weight precision
     # (1.5 GB weight.bin = 4 bytes/param). FLOAT16 cuts that in half but the
     # iPhone happily runs FP32 too and the HF copy is what's been validated
-    # device-side. Swift selects compute_units at load time (cpuAndGPU).
+    # device-side.
+    #
+    # compute_units=ALL lets the runtime bid for ANE in addition to CPU and
+    # GPU. The Swift consumer picks the actual dispatch via
+    # MLModelConfiguration.computeUnits — declaring ALL here just keeps ANE
+    # eligible. Previous version pinned CPU_AND_GPU which made ANE bidding
+    # impossible regardless of the Swift config.
     mlmodel = ct.convert(
         traced,
         inputs=inputs,
         outputs=outputs,
         compute_precision=ct.precision.FLOAT32,
-        compute_units=ct.ComputeUnit.CPU_AND_GPU,
+        compute_units=ct.ComputeUnit.ALL,
         minimum_deployment_target=ct.target.iOS18,
     )
 
@@ -2400,10 +2406,14 @@ def _ane_report_coreml(mlpackage_path: str) -> None:
             print(f"  MLComputePlan.load_from_path failed: {str(exc)[:200]}")
             return
 
-        device_counts = {"ANE": 0, "GPU": 0, "CPU": 0, "Unknown": 0}
-        op_type_devices: dict[str, dict[str, int]] = {}
+        pref_counts = {"ANE": 0, "GPU": 0, "CPU": 0, "Unknown": 0}
+        supp_counts = {"ANE": 0, "GPU": 0, "CPU": 0}  # union of supported per op
+        op_type_pref: dict[str, dict[str, int]] = {}
+        op_type_ane_supported: dict[str, int] = {}
 
         def _classify_device(device) -> str:
+            if device is None:
+                return "Unknown"
             name = type(device).__name__
             if "NeuralEngine" in name:
                 return "ANE"
@@ -2428,39 +2438,55 @@ def _ane_report_coreml(mlpackage_path: str) -> None:
             for op in _walk_ops(fn.block):
                 usage = plan.get_compute_device_usage_for_mlprogram_operation(op)
                 if usage is None:
-                    device_counts["Unknown"] += 1
+                    pref_counts["Unknown"] += 1
                     continue
-                dev = _classify_device(usage.preferred_compute_device)
-                device_counts[dev] += 1
-                op_type_devices.setdefault(op.operator_name, {"ANE": 0, "GPU": 0, "CPU": 0, "Unknown": 0})
-                op_type_devices[op.operator_name][dev] += 1
+                pref = _classify_device(usage.preferred_compute_device)
+                pref_counts[pref] += 1
 
-        total = sum(device_counts.values())
+                supp = {_classify_device(d) for d in (usage.supported_compute_devices or [])}
+                for d in supp & {"ANE", "GPU", "CPU"}:
+                    supp_counts[d] += 1
+
+                op_type_pref.setdefault(op.operator_name, {"ANE": 0, "GPU": 0, "CPU": 0, "Unknown": 0})
+                op_type_pref[op.operator_name][pref] += 1
+                if "ANE" in supp:
+                    op_type_ane_supported[op.operator_name] = op_type_ane_supported.get(op.operator_name, 0) + 1
+
+        total = sum(pref_counts.values())
         if total == 0:
             print("  No operations found in the program.")
             return
 
         print(f"  Total ops: {total}")
+        print(f"  Preferred dispatch (what the runtime would actually pick on this Mac):")
         for dev in ("ANE", "GPU", "CPU", "Unknown"):
-            c = device_counts[dev]
+            c = pref_counts[dev]
             if c:
                 print(f"    {dev:7s} {c:4d}  ({100 * c / total:5.1f}%)")
+        print(f"  Supported (ops eligible for each device, not necessarily preferred):")
+        for dev in ("ANE", "GPU", "CPU"):
+            c = supp_counts[dev]
+            print(f"    {dev:7s} {c:4d}  ({100 * c / total:5.1f}%)")
+        ane_potential = supp_counts["ANE"] - pref_counts["ANE"]
+        if ane_potential > 0:
+            print(f"  → {ane_potential} ops ({100 * ane_potential / total:.1f}%) are ANE-eligible "
+                  "but not preferred here. iPhone (newer ANE generation) may schedule them on ANE.")
 
-        # Top fallback op types — these are the ones blocking ANE residency
-        non_ane_by_type = sorted(
+        # Top op types where ANE *isn't* preferred but might be supported
+        gap_types = sorted(
             (
-                (op_type, sum(v[d] for d in ("GPU", "CPU", "Unknown")))
-                for op_type, v in op_type_devices.items()
+                (op_type, op_type_ane_supported.get(op_type, 0), v)
+                for op_type, v in op_type_pref.items()
+                if v.get("ANE", 0) == 0  # not currently going to ANE
             ),
-            key=lambda x: -x[1],
-        )
-        non_ane_by_type = [(t, n) for t, n in non_ane_by_type if n > 0][:8]
-        if non_ane_by_type:
-            print(f"  Top op types NOT on ANE (block ANE residency):")
-            for op_type, n in non_ane_by_type:
-                where = op_type_devices[op_type]
-                bits = " / ".join(f"{d}:{where[d]}" for d in ("ANE", "GPU", "CPU") if where[d])
-                print(f"    {op_type:30s} ({bits})")
+            key=lambda x: -(x[1] or sum(x[2].values())),
+        )[:8]
+        if gap_types:
+            print(f"  Top op types NOT preferring ANE:")
+            for op_type, ane_eligible, where in gap_types:
+                bits = " / ".join(f"{d}:{where[d]}" for d in ("GPU", "CPU", "Unknown") if where[d])
+                tag = f"ANE-supported on {ane_eligible}" if ane_eligible else "not ANE-eligible"
+                print(f"    {op_type:35s} ({bits})  [{tag}]")
 
 
 def _ane_report_onnx(onnx_path: str) -> None:
