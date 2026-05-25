@@ -80,12 +80,24 @@ python convert_chatterbox_coreml.py --stage lm-onnx --output-dir ./out \
     --optimize-graph --quantize int8
 
 # conditional_decoder.onnx: cfm-steps=1 only (1065 ms -> 685 ms per
-# synth; modest audio-quality cost). DO NOT combine with --optimize-graph
-# or --quantize on cond-decoder — both currently bake the encoder's
-# Conformer relative-attention shape, breaking runtime use at any
-# sequence length other than the trace fixture.
+# synth; modest audio-quality cost). --optimize-graph and --quantize
+# int8 are both automatically skipped on this stage with a printed
+# notice — both currently break runtime use (relative-attention shape
+# bake / MatMul shape inference). cfm-steps=1 is the only safe
+# size/speed knob here today.
 python convert_chatterbox_coreml.py --stage cond-decoder --output-dir ./out --cfm-steps 1
 ```
+
+Equivalent one-shot via `--stage v4`:
+
+```bash
+python convert_chatterbox_coreml.py --stage v4 --output-dir ./out \
+    --cfm-steps 1 --optimize-graph --quantize int8
+```
+
+Both `--optimize-graph` and `--quantize int8` silently no-op on
+cond-decoder with a printed notice; lm-onnx and T3Prefill apply them
+normally. Final bundle: ~1.2 GB.
 
 Measured on M1 (5-second utterance, 83 tokens):
 
@@ -132,13 +144,20 @@ your bundle), and run a real-device A/B before changing anything on HF.
 - **`--optimize-graph` on `cond-decoder`**: the ONNX Runtime graph
   optimizer specializes (bakes) shapes inside the Conformer encoder's
   relative-attention skewing operation. The exported model then only
-  runs at the trace-fixture sequence length. Skip `--optimize-graph`
-  for cond-decoder — the gain is modest there anyway since it isn't a
-  recognized `model_type` for the transformer-specific fusions.
-- **`--quantize int8` on `cond-decoder`**: `quantize_dynamic` runs but
-  produces a graph with the same shape-baking issue (likely interacting
-  with the optimizer pass internally). Treat cond-decoder as
-  quantize-incompatible for now.
+  runs at the trace-fixture sequence length. The converter
+  automatically skips `--optimize-graph` for cond-decoder with a
+  printed notice — you can safely pass the flag at the `--stage v4`
+  level; it just doesn't apply there.
+- **`--quantize int8` on `cond-decoder`**: silently skipped with a
+  printed notice. ORT's `quantize_dynamic` consistently breaks
+  downstream MatMul shape inference in the estimator's time-MLP
+  (whether the op set is default, Conv-only, or anything else
+  we tried), making the resulting graph fail to load. The
+  converter still applies a `nn.utils.parametrize` weight-norm
+  fuse on the HiFTGenerator convs first (necessary for any future
+  quantization to work), but skips the quantize_dynamic call
+  itself on this stage. Use `--cfm-steps 1` for the cond-decoder
+  speedup instead.
 - **CoreML INT8 ANE compute plan may differ from FP32.** Some quantized
   ops fall back to CPU on ANE that FP32 versions handled. Measure
   on-device.

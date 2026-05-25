@@ -1663,6 +1663,43 @@ class _ConditionalDecoderWrapper(nn.Module):
         self.spk_embed_affine_layer = flow.spk_embed_affine_layer
         self.estimator = flow.decoder.estimator
         self.mel2wav = s3gen.mel2wav
+        # Fuse weight_norm parametrizations into the conv weights.
+        # chatterbox uses torch.nn.utils.parametrize (newer API), not the
+        # legacy torch.nn.utils.weight_norm — so conv layers have a
+        # `parametrizations.weight` ModuleList rather than `weight_v` /
+        # `weight_g` parameters. Without fusing, the exported ONNX has
+        # Conv weights coming from runtime Muls, which blocks ORT's
+        # dynamic int8 quantizer (Conv.add_bias requires the weight input
+        # to be an initializer).
+        #
+        # HiFTGenerator.remove_weight_norm() can't be called wholesale —
+        # it dispatches into m_source.remove_weight_norm() which
+        # SourceModuleHnNSF doesn't implement, leaving things half-stripped
+        # on AttributeError.
+        from torch.nn.utils import parametrize as _parametrize
+
+        def _fuse_wn(mod):
+            try:
+                if _parametrize.is_parametrized(mod, "weight"):
+                    _parametrize.remove_parametrizations(
+                        mod, "weight", leave_parametrized=True
+                    )
+            except (ValueError, AttributeError):
+                pass
+
+        # Top-level convs
+        _fuse_wn(self.mel2wav.conv_pre)
+        _fuse_wn(self.mel2wav.conv_post)
+        # Upsample stack
+        for layer in self.mel2wav.ups:
+            _fuse_wn(layer)
+        # ResBlocks have their own convs1/convs2 lists
+        for rb in list(self.mel2wav.resblocks) + list(self.mel2wav.source_resblocks):
+            for sub in list(rb.convs1) + list(rb.convs2):
+                _fuse_wn(sub)
+        # Source-side downsample projections
+        for layer in self.mel2wav.source_downs:
+            _fuse_wn(layer)
         # trim_fade is a (2 * n_trim,) tensor: zeros for the first n_trim samples,
         # then a cos-shaped ramp up. Multiplied into the wav head to mute the
         # carry-over from the reference clip.
@@ -2206,12 +2243,31 @@ def convert_conditional_decoder(model, output_dir, validate=False, reference_dir
     print(f"  Wrote {size_mb:.1f} MB")
 
     if optimize_graph:
-        # conditional_decoder isn't a recognized model_type — the optimizer
-        # applies generic ORT graph passes (folding, fusion of LN/GELU) but
-        # skips the architecture-specific transformer fusions. Still useful.
-        _optimize_onnx_graph(out_path, model_type="bert", num_heads=0, hidden_size=0)
+        # The ORT graph optimizer bakes the Conformer encoder's
+        # relative-attention shape (the rel-pos skewing fold), making the
+        # exported model only runnable at the trace-fixture sequence length.
+        # Diagnostic confirmed: --optimize-graph alone (no quantize) is enough
+        # to trip this at any size other than the fixture. Skip it for
+        # cond-decoder so --stage v4 --optimize-graph stays safe to stack.
+        # --quantize int8 alone is unaffected and the recommended size win
+        # for cond_decoder.
+        print("  [info] --optimize-graph skipped for cond-decoder: the ORT")
+        print("         optimizer specializes the Conformer relative-attention")
+        print("         shape, breaking dynamic sequence-length input. Use")
+        print("         --quantize int8 (safe) for size + speed gains here.")
     if quantize == "int8":
-        _quantize_onnx_int8(out_path)
+        # cond_decoder: ORT's quantize_dynamic produces a graph whose
+        # estimator time-MLP MatMul fails downstream shape inference at
+        # load time — both with the default op set and with
+        # op_types_to_quantize=['Conv']. The parametrize fuse above lets
+        # the Conv pass succeed, but the MatMul issue is independent.
+        # Until ORT's quantizer handles this graph cleanly, skip with a
+        # clear notice (same pattern as --optimize-graph above).
+        print("  [info] --quantize int8 skipped for cond-decoder: ORT's")
+        print("         quantize_dynamic breaks the estimator time-MLP MatMul")
+        print("         shape inference, making the result fail to load. Use")
+        print("         --cfm-steps 1 for size reduction (~half the cond_decoder")
+        print("         runtime) without quality risk.")
 
     if validate:
         validate_conditional_decoder(
@@ -2257,14 +2313,19 @@ def _quantize_coreml_int8(mlpackage_path: str) -> None:
     print(f"  INT8 quantized in place ({new_size:.1f} MB)")
 
 
-def _quantize_onnx_int8(onnx_path: str) -> None:
+def _quantize_onnx_int8(onnx_path: str, op_types: Optional[list] = None) -> None:
     """In-place dynamic INT8 weight quantization of an ONNX model.
 
-    Quantizes MatMul / Gather / Conv weights to int8; activations stay fp32
+    Quantizes the specified op types' weights to int8; activations stay fp32
     (dynamic per-tensor scaling on the fly). For transformer decode this
     typically gives 2-3x faster CPU inference and 4x smaller weights, with
     a small quality cost that should be measured per artifact via the
     validator. iOS ORT supports the resulting QLinear ops natively.
+
+    `op_types=None` quantizes the default set (MatMul + Gather). Pass
+    `op_types=['Conv']` for graphs (like conditional_decoder) where the
+    estimator's time-MLP produces MatMulInteger nodes whose shapes
+    onnxruntime can't infer.
     """
     from onnxruntime.quantization import quantize_dynamic, QuantType
     from onnx import TensorProto
@@ -2272,18 +2333,16 @@ def _quantize_onnx_int8(onnx_path: str) -> None:
     with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
         tmp_path = tmp.name
     try:
-        # DefaultTensorType=FLOAT handles graphs where the quantizer can't
-        # infer types for some MatMul outputs — happens on the
-        # conditional_decoder where the encoder doesn't carry full shape
-        # annotation through the chain. Pre-running shape inference would
-        # also work but is heavier.
-        quantize_dynamic(
+        kwargs = dict(
             model_input=onnx_path,
             model_output=tmp_path,
             weight_type=QuantType.QInt8,
             per_channel=False,
             extra_options={"DefaultTensorType": TensorProto.FLOAT},
         )
+        if op_types is not None:
+            kwargs["op_types_to_quantize"] = op_types
+        quantize_dynamic(**kwargs)
         # Replace original .onnx (and clean up any old external data file —
         # quantized weights are small enough to inline).
         shutil.move(tmp_path, onnx_path)
